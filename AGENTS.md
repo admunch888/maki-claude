@@ -1,14 +1,15 @@
 maki-claude puts a Claude subscription behind maki's dynamic provider mechanism.
 It loads through the maki pack system, not as a builtin. Two parts:
 
-- `providers/claude`: a Python 3 script, the maki dynamic provider. Login,
-  token refresh, and the loopback proxy that renames tools on the wire and
-  adds the Claude Code headers. Standard library only, one file, no `.py`
-  extension because maki runs it by name.
+- `providers/claude`: a Python 3 script, the maki dynamic provider. OAuth
+  login, token storage, and refresh. Standard library only, one file, no
+  `.py` extension because maki runs it by name. `info` declares the Claude
+  Code identity line as the system prefix; that is the only thing the
+  subscription token requires of a request, verified against Opus, Sonnet,
+  and Fable with flat maki tool names and no extra headers.
 - `plugin/maki_claude.lua`: installs the script into the config `providers/`
-  directory, runs `claude serve` as a plugin-scoped job, registers `/claude`
-  for a status line. Keep it to that: anything else the script can do is
-  reachable through `maki auth` or by running the script directly.
+  directory and registers `/claude` for a status line. Keep it to that:
+  anything else the script can do is reachable through `maki auth`.
 
 ## Code guidelines
 
@@ -19,8 +20,6 @@ It loads through the maki pack system, not as a builtin. Two parts:
   failing the package.
 - Python: user-facing failures raise `Fail`; `main` prints them to stderr and
   exits non-zero, which is how maki surfaces script errors.
-- The proxy must never read or store tokens. Auth arrives from maki in the
-  `authorization` header and is forwarded as is.
 - `plugin.toml` grants exactly what the Lua calls. Keep it aligned by hand.
 
 ## Testing
@@ -29,15 +28,13 @@ Cheapest first:
 
 - `just check` runs `cargo check --tests` and byte-compiles the script.
 - `just lint`
-- `just test-py` runs the Python tests, including the proxy end to end
-  against a fake upstream.
+- `just test-py` runs the Python tests.
 - `just test` runs both suites; the Rust part needs `cargo-nextest`.
 
 The Rust tests load the package through `PluginHost::load_package`, passing the
-repo root. Loading installs the script and starts the proxy, so the test points
-`HOME` and the XDG variables at a temporary directory before creating the host.
-Assert Lua-visible effects: the registered command, the installed file, the
-proxy answering on the port it wrote.
+repo root. Loading installs the script, so the test points `HOME` and the XDG
+variables at a temporary directory before creating the host. Assert
+Lua-visible effects: the registered command and the installed file.
 
 Dev-dependencies pin a revision of maki. Move the pin when the host changes
 what the plugin uses.

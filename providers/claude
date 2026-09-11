@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
 """maki dynamic provider for a Claude subscription (Pro or Max) over OAuth.
 
-maki calls `info`, `resolve`, `reload`, `refresh`, `login` and `logout`. The
-maki-claude plugin installs this file into the config `providers/` directory,
-keeps `serve` running as a job for the lifetime of the maki process, and calls
-`status` for the /claude command.
-
-`serve` is a loopback HTTP proxy in front of api.anthropic.com. The subscription
-token is only accepted for requests that look like Claude Code, so the proxy
-adds the OAuth beta headers and Claude Code client headers, and renames tools
-the way pi-claude does: Claude Code core tools get their canonical casing and
-every other flat tool becomes `mcp__maki__<name>` on the wire, then tool calls
-coming back are renamed to what maki registered.
+maki calls `info`, `resolve`, `reload`, `refresh`, `login` and `logout`; the
+maki-claude plugin calls `status` for the /claude command. The subscription
+token is accepted only when the system prompt opens with the Claude Code
+identity line as its own block, which `info` declares as maki's system prefix.
 """
 
 import base64
 import hashlib
-import http.client
 import http.server
 import json
 import os
 import secrets
 import select
-import socket
 import sys
 import threading
 import time
@@ -40,59 +31,14 @@ SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_co
 CALLBACK_HOST = "127.0.0.1"
 CALLBACK_PORT = 53692
 CALLBACK_PATH = "/callback"
-CONSOLE_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
-UPSTREAM = os.environ.get("MAKI_CLAUDE_UPSTREAM", "https://api.anthropic.com")
-# maki polls subscription usage only for base URLs that mention the Anthropic
-# host, so the proxy base URL carries it as a path segment and strips it again.
-UPSTREAM_MARKER = "/api.anthropic.com"
-MESSAGES_PATH = "/v1/messages"
-HEALTH_PATH = "/healthz"
-OAUTH_BETAS = ("claude-code-20250219", "oauth-2025-04-20")
-CLAUDE_CLI_VERSION = "2.1.251"
-USER_AGENT = "claude-cli/%s (external, cli)" % CLAUDE_CLI_VERSION
+REDIRECT_URI = "http://localhost:%d%s" % (CALLBACK_PORT, CALLBACK_PATH)
+USER_AGENT = "claude-cli/2.1.251 (external, cli)"
 IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
-ALIAS_PREFIX = "mcp__maki__"
-MCP_PREFIX = "mcp__"
-CORE_TOOLS = (
-    "Read",
-    "Write",
-    "Edit",
-    "Bash",
-    "Grep",
-    "Glob",
-    "AskUserQuestion",
-    "EnterPlanMode",
-    "ExitPlanMode",
-    "KillShell",
-    "NotebookEdit",
-    "Skill",
-    "Task",
-    "TaskOutput",
-    "TodoWrite",
-    "WebFetch",
-    "WebSearch",
-)
-CORE_LOOKUP = {name.lower(): name for name in CORE_TOOLS}
-BATCH_TOOL = "batch"
-BATCH_CALLS_FIELD = "tool_calls"
-BATCH_TOOL_FIELD = "tool"
-NAME_LIMIT = 64
 REFRESH_MARGIN_S = 300
 HTTP_TIMEOUT_S = 30
-STREAM_TIMEOUT_S = 600
-PORT_WAIT_S = 5.0
-PORT_POLL_S = 0.2
-PROXY_PORT_BASE = 47000
-PROXY_PORT_SPAN = 10000
-PROXY_PORT_ENV = "MAKI_CLAUDE_PROXY_PORT"
-PARENT_POLL_S = 2.0
 STDIN_POLL_S = 0.25
-READ_CHUNK = 65536
 TOKEN_FILE_MODE = 0o600
 PRIVATE_DIR_MODE = 0o700
-HOP_BY_HOP = frozenset({"connection", "keep-alive", "transfer-encoding", "upgrade"})
-REQUEST_HEADERS_DROPPED = HOP_BY_HOP | {"host", "content-length", "user-agent", "accept-encoding", "expect"}
-RESPONSE_HEADERS_DROPPED = HOP_BY_HOP | {"content-length", "content-encoding"}
 NOT_LOGGED_IN = "not logged in to Claude: run `maki auth login claude`"
 
 
@@ -100,47 +46,29 @@ class Fail(Exception):
     """An error the user reads on stderr; the exit code tells maki it failed."""
 
 
-def maki_dirs():
+def state_dir():
     home = os.path.expanduser("~")
     legacy = os.path.join(home, ".maki")
     if os.path.isdir(legacy):
-        return legacy, legacy
-    config_base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
-    state_base = os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state")
-    return os.path.join(config_base, "maki"), os.path.join(state_base, "maki")
+        return legacy
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state")
+    return os.path.join(base, "maki")
 
 
 def token_path():
-    return os.path.join(maki_dirs()[1], "auth", SLUG + ".json")
-
-
-def port_file(maki_pid):
-    return os.path.join(maki_dirs()[1], "maki-claude", "proxy-%d.json" % maki_pid)
+    return os.path.join(state_dir(), "auth", SLUG + ".json")
 
 
 def now_ms():
     return int(time.time() * 1000)
 
 
-def read_json(path):
+def load_tokens():
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
+        with open(token_path(), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
     except (OSError, ValueError):
         return None
-
-
-def write_private_json(path, data):
-    os.makedirs(os.path.dirname(path), PRIVATE_DIR_MODE, exist_ok=True)
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, TOKEN_FILE_MODE)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2)
-    os.replace(tmp, path)
-
-
-def load_tokens():
-    data = read_json(token_path())
     if not isinstance(data, dict):
         return None
     if not all(isinstance(data.get(key), str) for key in ("access", "refresh")):
@@ -148,6 +76,16 @@ def load_tokens():
     if not isinstance(data.get("expires"), int):
         return None
     return data
+
+
+def save_tokens(tokens):
+    path = token_path()
+    os.makedirs(os.path.dirname(path), PRIVATE_DIR_MODE, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, TOKEN_FILE_MODE)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(tokens, handle, indent=2)
+    os.replace(tmp, path)
 
 
 def require_tokens():
@@ -162,10 +100,9 @@ def expires_within(tokens, seconds):
 
 
 def post_json(url, body):
-    payload = json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
         url,
-        data=payload,
+        data=json.dumps(body).encode("utf-8"),
         headers={"content-type": "application/json", "accept": "application/json", "user-agent": USER_AGENT},
         method="POST",
     )
@@ -173,8 +110,7 @@ def post_json(url, body):
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
             text = response.read().decode("utf-8")
     except urllib.error.HTTPError as err:
-        detail = err.read().decode("utf-8", "replace").strip()
-        raise Fail("%s answered %d: %s" % (url, err.code, detail))
+        raise Fail("%s answered %d: %s" % (url, err.code, err.read().decode("utf-8", "replace").strip()))
     except OSError as err:
         raise Fail("%s unreachable: %s" % (url, err))
     try:
@@ -205,332 +141,12 @@ def refresh_tokens(tokens):
         {"grant_type": "refresh_token", "client_id": CLIENT_ID, "refresh_token": tokens["refresh"]},
     )
     fresh = tokens_from_response(data, tokens)
-    write_private_json(token_path(), fresh)
+    save_tokens(fresh)
     return fresh
 
 
-def port_alive(port):
-    try:
-        with socket.create_connection((CALLBACK_HOST, port), timeout=0.5):
-            return True
-    except OSError:
-        return False
-
-
-def proxy_port(maki_pid):
-    override = os.environ.get(PROXY_PORT_ENV)
-    if override:
-        return int(override)
-    path = port_file(maki_pid)
-    deadline = time.monotonic() + PORT_WAIT_S
-    while True:
-        info = read_json(path)
-        if isinstance(info, dict) and isinstance(info.get("port"), int) and port_alive(info["port"]):
-            return info["port"]
-        if time.monotonic() >= deadline:
-            raise Fail(
-                "maki-claude proxy is not running for maki pid %d; "
-                "the maki-claude plugin starts it, see maki.log" % maki_pid
-            )
-        time.sleep(PORT_POLL_S)
-
-
-def auth_json(tokens, port):
-    return {
-        "base_url": "http://%s:%d%s" % (CALLBACK_HOST, port, UPSTREAM_MARKER),
-        "headers": {"authorization": "Bearer " + tokens["access"]},
-    }
-
-
-def emit(data):
-    sys.stdout.write(json.dumps(data) + "\n")
-    sys.stdout.flush()
-
-
-# Wire rewriting
-
-
-def wire_name(name):
-    canonical = CORE_LOOKUP.get(name.lower())
-    if canonical:
-        return canonical
-    if name.startswith(MCP_PREFIX):
-        return name
-    alias = ALIAS_PREFIX + name
-    return alias if len(alias) <= NAME_LIMIT else name
-
-
-def restore_name(alias_of, name):
-    if name in alias_of:
-        return alias_of[name]
-    if name.startswith(ALIAS_PREFIX):
-        return name[len(ALIAS_PREFIX):]
-    lower = name.lower()
-    if lower in CORE_LOOKUP:
-        return lower
-    return name
-
-
-def transform_payload(payload):
-    """Rename tools in place. Returns the payload and the alias to name map."""
-    alias_of = {}
-
-    def rename(name):
-        wire = wire_name(name)
-        if wire != name:
-            alias_of[wire] = name
-        return wire
-
-    tools = payload.get("tools")
-    if isinstance(tools, list):
-        for tool in tools:
-            if isinstance(tool, dict) and tool.get("type") is None and isinstance(tool.get("name"), str):
-                tool["name"] = rename(tool["name"])
-    messages = payload.get("messages")
-    if isinstance(messages, list):
-        for message in messages:
-            content = message.get("content") if isinstance(message, dict) else None
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_use" and isinstance(block.get("name"), str):
-                    block["name"] = rename(block["name"])
-    return payload, alias_of
-
-
-def merge_betas(existing):
-    merged = list(OAUTH_BETAS)
-    for value in existing:
-        for beta in value.split(","):
-            beta = beta.strip()
-            if beta and beta not in merged:
-                merged.append(beta)
-    return merged
-
-
-def upstream_headers(items, body_length):
-    out = {}
-    betas = []
-    for key, value in items:
-        lower = key.lower()
-        if lower in REQUEST_HEADERS_DROPPED:
-            continue
-        if lower == "anthropic-beta":
-            betas.append(value)
-            continue
-        out[key] = value
-    out["anthropic-beta"] = ",".join(merge_betas(betas))
-    out["user-agent"] = USER_AGENT
-    out["x-app"] = "cli"
-    out["accept-encoding"] = "identity"
-    if body_length:
-        out["content-length"] = str(body_length)
-    return out
-
-
-def encode_event(event):
-    return b"data: " + json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode("utf-8") + b"\n"
-
-
-class SseRewriter:
-    """Restores tool names in a server-sent event stream, one record at a time.
-
-    A record is the lines up to a blank line. `content_block_start` carries the
-    wire name of a tool call, so it is rewritten there. The `batch` tool names
-    other tools inside its input, which arrives as `input_json_delta` pieces,
-    so a batch block is held back and sent as one delta at `content_block_stop`.
-    """
-
-    def __init__(self, alias_of):
-        self.alias_of = alias_of
-        self.record = []
-        self.held = []
-        self.fragments = []
-        self.buffered_index = None
-
-    def feed(self, line):
-        self.record.append(line)
-        if line.strip():
-            return []
-        record, self.record = self.record, []
-        return self.process(record)
-
-    def process(self, record):
-        data_at = next((i for i, line in enumerate(record) if line.startswith(b"data:")), None)
-        if data_at is None:
-            return record
-        try:
-            event = json.loads(record[data_at][len(b"data:"):])
-        except ValueError:
-            return record
-        if not isinstance(event, dict):
-            return record
-        kind = event.get("type")
-        if kind == "content_block_start":
-            block = event.get("content_block")
-            if isinstance(block, dict) and block.get("type") == "tool_use" and isinstance(block.get("name"), str):
-                block["name"] = restore_name(self.alias_of, block["name"])
-                record[data_at] = encode_event(event)
-                if block["name"] == BATCH_TOOL:
-                    self.buffered_index = event.get("index")
-                    self.held = []
-                    self.fragments = []
-            return record
-        if self.buffered_index is None or event.get("index") != self.buffered_index:
-            return record
-        if kind == "content_block_delta":
-            delta = event.get("delta")
-            if isinstance(delta, dict) and delta.get("type") == "input_json_delta":
-                self.fragments.append(delta.get("partial_json") or "")
-                self.held.extend(record)
-                return []
-            return record
-        if kind == "content_block_stop":
-            held, fragments = self.held, self.fragments
-            self.held, self.fragments, self.buffered_index = [], [], None
-            rewritten = self.rewrite_batch("".join(fragments))
-            if rewritten is None:
-                return held + record
-            delta = {
-                "type": "content_block_delta",
-                "index": event["index"],
-                "delta": {"type": "input_json_delta", "partial_json": rewritten},
-            }
-            return [b"event: content_block_delta\n", encode_event(delta), b"\n"] + record
-        return record
-
-    def rewrite_batch(self, text):
-        try:
-            data = json.loads(text)
-        except ValueError:
-            return None
-        calls = data.get(BATCH_CALLS_FIELD) if isinstance(data, dict) else None
-        if not isinstance(calls, list):
-            return None
-        for entry in calls:
-            if isinstance(entry, dict) and isinstance(entry.get(BATCH_TOOL_FIELD), str):
-                entry[BATCH_TOOL_FIELD] = restore_name(self.alias_of, entry[BATCH_TOOL_FIELD])
-        return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
-
-
-def open_upstream():
-    parts = urllib.parse.urlsplit(UPSTREAM)
-    if parts.scheme == "https":
-        return http.client.HTTPSConnection(parts.hostname, parts.port, timeout=STREAM_TIMEOUT_S)
-    return http.client.HTTPConnection(parts.hostname, parts.port, timeout=STREAM_TIMEOUT_S)
-
-
-class Relay(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_request(self, code="-", size="-"):
-        pass
-
-    def do_GET(self):
-        self.relay()
-
-    def do_POST(self):
-        self.relay()
-
-    def send_text(self, status, text):
-        body = text.encode("utf-8")
-        self.send_response(status)
-        self.send_header("content-type", "text/plain; charset=utf-8")
-        self.send_header("content-length", str(len(body)))
-        self.send_header("connection", "close")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def relay(self):
-        self.close_connection = True
-        path = self.path
-        if path.startswith(UPSTREAM_MARKER + "/"):
-            path = path[len(UPSTREAM_MARKER):]
-        if path == HEALTH_PATH:
-            self.send_text(200, "ok")
-            return
-        length = int(self.headers.get("content-length") or 0)
-        body = self.rfile.read(length) if length else b""
-        alias_of = {}
-        if self.command == "POST" and path.split("?", 1)[0] == MESSAGES_PATH and body:
-            try:
-                payload, alias_of = transform_payload(json.loads(body))
-                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            except (ValueError, TypeError, AttributeError):
-                alias_of = {}
-        headers = upstream_headers(self.headers.items(), len(body))
-        try:
-            upstream = open_upstream()
-            upstream.request(self.command, path, body=body or None, headers=headers)
-            response = upstream.getresponse()
-        except OSError as err:
-            self.send_text(502, "maki-claude proxy: upstream request failed: %s" % err)
-            return
-        try:
-            self.send_response(response.status)
-            for key, value in response.getheaders():
-                if key.lower() not in RESPONSE_HEADERS_DROPPED:
-                    self.send_header(key, value)
-            self.send_header("connection", "close")
-            self.end_headers()
-            if "text/event-stream" in (response.getheader("content-type") or ""):
-                self.copy_events(response, alias_of)
-            else:
-                self.copy_bytes(response)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        finally:
-            upstream.close()
-
-    def copy_events(self, response, alias_of):
-        rewriter = SseRewriter(alias_of)
-        while True:
-            line = response.readline()
-            if not line:
-                break
-            for out in rewriter.feed(line):
-                self.wfile.write(out)
-            self.wfile.flush()
-
-    def copy_bytes(self, response):
-        while True:
-            chunk = response.read1(READ_CHUNK)
-            if not chunk:
-                break
-            self.wfile.write(chunk)
-            self.wfile.flush()
-
-
-def build_server(port):
-    try:
-        return http.server.ThreadingHTTPServer((CALLBACK_HOST, port), Relay)
-    except OSError:
-        return http.server.ThreadingHTTPServer((CALLBACK_HOST, 0), Relay)
-
-
-def cmd_serve(args):
-    maki_pid = os.getppid()
-    override = os.environ.get(PROXY_PORT_ENV)
-    wanted = int(override) if override else PROXY_PORT_BASE + maki_pid % PROXY_PORT_SPAN
-    server = build_server(wanted)
-    port = server.server_address[1]
-    path = port_file(maki_pid)
-    write_private_json(path, {"port": port, "pid": os.getpid()})
-
-    # maki kills the job with SIGKILL, and a crashed maki leaves it running, so
-    # the proxy watches its parent instead of relying on a signal.
-    def watch_parent():
-        while os.getppid() == maki_pid:
-            time.sleep(PARENT_POLL_S)
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        os._exit(0)
-
-    threading.Thread(target=watch_parent, daemon=True).start()
-    print("maki-claude proxy listening on %s:%d for maki pid %d" % (CALLBACK_HOST, port, maki_pid), flush=True)
-    server.serve_forever()
+def emit_auth(tokens):
+    sys.stdout.write(json.dumps({"headers": {"authorization": "Bearer " + tokens["access"]}}) + "\n")
 
 
 # Login
@@ -599,15 +215,16 @@ class CallbackHandler(http.server.BaseHTTPRequestHandler):
 
 
 def wait_for_code(server, expected_state):
+    """Returns the code from whichever arrives first: the browser callback or a
+    pasted redirect URL on stdin. A closed stdin leaves only the callback."""
     sys.stdout.write("> ")
     sys.stdout.flush()
     stdin_open = True
     while True:
-        if server is not None:
-            if server.failure:
-                raise Fail(server.failure)
-            if server.result:
-                return server.result
+        if server.failure:
+            raise Fail(server.failure)
+        if server.result:
+            return server.result
         if not stdin_open:
             time.sleep(STDIN_POLL_S)
             continue
@@ -616,8 +233,6 @@ def wait_for_code(server, expected_state):
             continue
         line = sys.stdin.readline()
         if not line:
-            if server is None:
-                raise Fail("no authorization code was provided")
             stdin_open = False
             continue
         code, state = parse_authorization_input(line)
@@ -625,31 +240,30 @@ def wait_for_code(server, expected_state):
             if state is not None and state != expected_state:
                 raise Fail("OAuth state mismatch, start the login again")
             return code, state or expected_state
-        sys.stdout.write("no code found in that input, paste the code or the redirect URL\n> ")
+        sys.stdout.write("no code found in that input, paste the redirect URL\n> ")
         sys.stdout.flush()
 
 
-def cmd_login(args):
+def has_desktop():
+    return sys.platform == "darwin" or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def cmd_login():
     verifier = base64url(secrets.token_bytes(32))
     challenge = base64url(hashlib.sha256(verifier.encode("ascii")).digest())
     # The authorize page accepts the verifier as state, which is what pi sends.
     state = verifier
-    server = None
-    if "--manual" not in args:
-        try:
-            server = CallbackServer(state)
-        except OSError:
-            server = None
-    redirect_uri = CONSOLE_REDIRECT_URI
-    if server is not None:
-        redirect_uri = "http://localhost:%d%s" % (CALLBACK_PORT, CALLBACK_PATH)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        server = CallbackServer(state)
+    except OSError as err:
+        raise Fail("cannot listen on %s: %s" % (REDIRECT_URI, err))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     query = urllib.parse.urlencode(
         {
             "code": "true",
             "client_id": CLIENT_ID,
             "response_type": "code",
-            "redirect_uri": redirect_uri,
+            "redirect_uri": REDIRECT_URI,
             "scope": SCOPES,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
@@ -658,18 +272,14 @@ def cmd_login(args):
     )
     url = AUTHORIZE_URL + "?" + query
     print("Log in to Claude in your browser:\n\n  %s\n" % url)
-    if "--no-browser" not in args:
+    if has_desktop():
         webbrowser.open(url)
-    if server is not None:
-        print("Waiting for the browser. If it runs on another machine, paste the final redirect URL here.")
-    else:
-        print("Paste the code the page shows after login (it looks like code#state).")
+    print("Waiting for the browser. If it runs on another machine, paste the final redirect URL here.")
     try:
         code, got_state = wait_for_code(server, state)
     finally:
-        if server is not None:
-            server.shutdown()
-            server.server_close()
+        server.shutdown()
+        server.server_close()
     print("Exchanging the code for tokens...", flush=True)
     data = post_json(
         TOKEN_URL,
@@ -678,18 +288,17 @@ def cmd_login(args):
             "client_id": CLIENT_ID,
             "code": code,
             "state": got_state,
-            "redirect_uri": redirect_uri,
+            "redirect_uri": REDIRECT_URI,
             "code_verifier": verifier,
         },
     )
     tokens = tokens_from_response(data)
-    write_private_json(token_path(), tokens)
-    who = tokens.get("email", "your Claude account")
-    print("Logged in as %s. Tokens are in %s." % (who, token_path()))
+    save_tokens(tokens)
+    print("Logged in as %s. Tokens are in %s." % (tokens.get("email", "your Claude account"), token_path()))
     print("Restart maki if it is running, then pick a model, for example: /model claude/claude-opus-5")
 
 
-def cmd_logout(args):
+def cmd_logout():
     try:
         os.remove(token_path())
     except FileNotFoundError:
@@ -698,39 +307,34 @@ def cmd_logout(args):
     print("Claude tokens removed")
 
 
-def cmd_info(args):
-    emit({"display_name": DISPLAY_NAME, "base": "anthropic", "has_auth": True, "system_prefix": IDENTITY})
+def cmd_info():
+    info = {"display_name": DISPLAY_NAME, "base": "anthropic", "has_auth": True, "system_prefix": IDENTITY}
+    sys.stdout.write(json.dumps(info) + "\n")
 
 
-def cmd_resolve(args):
+def cmd_resolve():
     tokens = require_tokens()
     if expires_within(tokens, REFRESH_MARGIN_S):
         tokens = refresh_tokens(tokens)
-    emit(auth_json(tokens, proxy_port(os.getppid())))
+    emit_auth(tokens)
 
 
-def cmd_reload(args):
-    emit(auth_json(require_tokens(), proxy_port(os.getppid())))
+def cmd_reload():
+    emit_auth(require_tokens())
 
 
-def cmd_refresh(args):
-    emit(auth_json(refresh_tokens(require_tokens()), proxy_port(os.getppid())))
+def cmd_refresh():
+    emit_auth(refresh_tokens(require_tokens()))
 
 
-def cmd_status(args):
+def cmd_status():
     tokens = load_tokens()
-    info = read_json(port_file(os.getppid()))
-    proxy = None
-    if isinstance(info, dict) and isinstance(info.get("port"), int):
-        proxy = {"port": info["port"], "alive": port_alive(info["port"])}
-    emit(
-        {
-            "logged_in": tokens is not None,
-            "email": (tokens or {}).get("email"),
-            "expires_in_s": (tokens["expires"] - now_ms()) // 1000 if tokens else None,
-            "proxy": proxy,
-        }
-    )
+    status = {
+        "logged_in": tokens is not None,
+        "email": (tokens or {}).get("email"),
+        "expires_in_s": (tokens["expires"] - now_ms()) // 1000 if tokens else None,
+    }
+    sys.stdout.write(json.dumps(status) + "\n")
 
 
 COMMANDS = {
@@ -740,17 +344,16 @@ COMMANDS = {
     "refresh": cmd_refresh,
     "login": cmd_login,
     "logout": cmd_logout,
-    "serve": cmd_serve,
     "status": cmd_status,
 }
 
 
 def main(argv):
-    if len(argv) < 2 or argv[1] not in COMMANDS:
+    if len(argv) != 2 or argv[1] not in COMMANDS:
         sys.stderr.write("usage: claude <%s>\n" % "|".join(COMMANDS))
         return 2
     try:
-        COMMANDS[argv[1]](argv[2:])
+        COMMANDS[argv[1]]()
     except Fail as err:
         sys.stderr.write("%s\n" % err)
         return 1

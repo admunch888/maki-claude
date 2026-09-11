@@ -1,11 +1,9 @@
 -- Claude subscription for maki. The provider itself is `providers/claude` in
 -- this package, a maki dynamic provider script. This file installs it into the
--- config directory, keeps its loopback proxy running as a job for the life of
--- this maki process, and adds /claude for a status line.
+-- config directory and adds /claude for a status line.
 
 local SCRIPT_NAME = "claude"
 local PROVIDERS_DIR = "providers"
-local PROXY_JOB = "maki-claude-proxy"
 local SCRIPT_MODE = "755"
 local JOB_WAIT_MS = 20000
 local TITLE = "claude"
@@ -74,50 +72,15 @@ local function install_script()
   return dst, nil, true
 end
 
-local function start_proxy(script)
-  if maki.fn.jobfind(PROXY_JOB) then
-    return true
-  end
-  local ok, err = pcall(maki.fn.jobstart, { script, "serve" }, {
-    scope = "plugin",
-    name = PROXY_JOB,
-    on_stdout = function(_, line)
-      maki.log.info("claude proxy: " .. line)
-    end,
-    on_stderr = function(_, line)
-      maki.log.warn("claude proxy: " .. line)
-    end,
-    on_exit = function(_, code)
-      maki.log.warn("claude proxy exited with code " .. tostring(code))
-    end,
-  })
-  if not ok then
-    return nil, tostring(err)
-  end
-  return true
-end
-
-local function describe_expiry(seconds)
-  if seconds <= 0 then
-    return "token expired, it refreshes on the next request"
-  end
-  return ("token valid for %d min"):format(math.floor(seconds / 60))
-end
-
 local function status_line(s)
-  local parts = {}
-  if s.logged_in then
-    parts[#parts + 1] = "logged in" .. (s.email and (" as " .. s.email) or "")
-    parts[#parts + 1] = describe_expiry(s.expires_in_s)
-  else
-    parts[#parts + 1] = "not logged in, " .. LOGIN_HINT
+  if not s.logged_in then
+    return "not logged in, " .. LOGIN_HINT
   end
-  if s.proxy then
-    parts[#parts + 1] = ("proxy :%d %s"):format(s.proxy.port, s.proxy.alive and "up" or "down")
-  else
-    parts[#parts + 1] = "proxy not started"
+  local who = s.email and (" as " .. s.email) or ""
+  if s.expires_in_s <= 0 then
+    return "logged in" .. who .. ", token expired, it refreshes on the next request"
   end
-  return table.concat(parts, ", ")
+  return ("logged in%s, token valid for %d min"):format(who, math.floor(s.expires_in_s / 60))
 end
 
 local function status()
@@ -143,7 +106,7 @@ end
 
 maki.api.register_command({
   name = "claude",
-  description = "Claude subscription: login state and proxy status",
+  description = "Claude subscription: login state and token expiry",
   handler = status,
 })
 
@@ -151,12 +114,6 @@ local path, err, changed = install_script()
 if not path then
   maki.log.error("maki-claude: " .. err)
   notify(err, "error")
-  return
-end
-local started, start_err = start_proxy(path)
-if not started then
-  maki.log.error("maki-claude: " .. start_err)
-  notify(start_err, "error")
   return
 end
 if changed then

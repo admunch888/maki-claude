@@ -1,7 +1,7 @@
 min_maki_version = "0.5.3"
 
 # fs_read and fs_write install the provider script into the config directory,
-# run starts the proxy job and calls the script for /claude.
+# run marks it executable and calls it for /claude.
 [permissions]
 fs_read = true
 fs_write = true
