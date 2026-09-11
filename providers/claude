@@ -4,7 +4,7 @@
 maki calls `info`, `resolve`, `reload`, `refresh`, `login` and `logout`. The
 maki-claude plugin installs this file into the config `providers/` directory,
 keeps `serve` running as a job for the lifetime of the maki process, and calls
-`status` and `usage` for the /claude command.
+`status` for the /claude command.
 
 `serve` is a loopback HTTP proxy in front of api.anthropic.com. The subscription
 token is only accepted for requests that look like Claude Code, so the proxy
@@ -22,7 +22,6 @@ import json
 import os
 import secrets
 import select
-import signal
 import socket
 import sys
 import threading
@@ -47,7 +46,6 @@ UPSTREAM = os.environ.get("MAKI_CLAUDE_UPSTREAM", "https://api.anthropic.com")
 # host, so the proxy base URL carries it as a path segment and strips it again.
 UPSTREAM_MARKER = "/api.anthropic.com"
 MESSAGES_PATH = "/v1/messages"
-USAGE_PATH = "/api/oauth/usage"
 HEALTH_PATH = "/healthz"
 OAUTH_BETAS = ("claude-code-20250219", "oauth-2025-04-20")
 CLAUDE_CLI_VERSION = "2.1.251"
@@ -75,7 +73,6 @@ CORE_TOOLS = (
     "WebSearch",
 )
 CORE_LOOKUP = {name.lower(): name for name in CORE_TOOLS}
-RENAMABLE_TOOL_TYPES = (None, "custom")
 BATCH_TOOL = "batch"
 BATCH_CALLS_FIELD = "tool_calls"
 BATCH_TOOL_FIELD = "tool"
@@ -93,19 +90,7 @@ STDIN_POLL_S = 0.25
 READ_CHUNK = 65536
 TOKEN_FILE_MODE = 0o600
 PRIVATE_DIR_MODE = 0o700
-HOP_BY_HOP = frozenset(
-    {
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "proxy-connection",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-    }
-)
+HOP_BY_HOP = frozenset({"connection", "keep-alive", "transfer-encoding", "upgrade"})
 REQUEST_HEADERS_DROPPED = HOP_BY_HOP | {"host", "content-length", "user-agent", "accept-encoding", "expect"}
 RESPONSE_HEADERS_DROPPED = HOP_BY_HOP | {"content-length", "content-encoding"}
 NOT_LOGGED_IN = "not logged in to Claude: run `maki auth login claude`"
@@ -129,12 +114,8 @@ def token_path():
     return os.path.join(maki_dirs()[1], "auth", SLUG + ".json")
 
 
-def run_dir():
-    return os.path.join(maki_dirs()[1], "maki-claude")
-
-
 def port_file(maki_pid):
-    return os.path.join(run_dir(), "proxy-%d.json" % maki_pid)
+    return os.path.join(maki_dirs()[1], "maki-claude", "proxy-%d.json" % maki_pid)
 
 
 def now_ms():
@@ -210,15 +191,11 @@ def tokens_from_response(data, previous=None):
         raise Fail("token response is missing access_token, refresh_token or expires_in")
     tokens = {"access": access, "refresh": refresh, "expires": now_ms() + int(expires_in) * 1000}
     account = data.get("account")
-    if isinstance(account, dict):
-        if isinstance(account.get("uuid"), str):
-            tokens["account_id"] = account["uuid"]
-        if isinstance(account.get("email_address"), str):
-            tokens["email"] = account["email_address"]
-    elif previous:
-        for key in ("account_id", "email"):
-            if key in previous:
-                tokens[key] = previous[key]
+    email = account.get("email_address") if isinstance(account, dict) else None
+    if not isinstance(email, str) and previous:
+        email = previous.get("email")
+    if isinstance(email, str):
+        tokens["email"] = email
     return tokens
 
 
@@ -274,8 +251,6 @@ def emit(data):
 
 
 def wire_name(name):
-    if not isinstance(name, str) or not name:
-        return name
     canonical = CORE_LOOKUP.get(name.lower())
     if canonical:
         return canonical
@@ -309,7 +284,7 @@ def transform_payload(payload):
     tools = payload.get("tools")
     if isinstance(tools, list):
         for tool in tools:
-            if isinstance(tool, dict) and tool.get("type") in RENAMABLE_TOOL_TYPES and isinstance(tool.get("name"), str):
+            if isinstance(tool, dict) and tool.get("type") is None and isinstance(tool.get("name"), str):
                 tool["name"] = rename(tool["name"])
     messages = payload.get("messages")
     if isinstance(messages, list):
@@ -320,9 +295,6 @@ def transform_payload(payload):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_use" and isinstance(block.get("name"), str):
                     block["name"] = rename(block["name"])
-    choice = payload.get("tool_choice")
-    if isinstance(choice, dict) and choice.get("type") == "tool" and isinstance(choice.get("name"), str):
-        choice["name"] = rename(choice["name"])
     return payload, alias_of
 
 
@@ -382,10 +354,6 @@ class SseRewriter:
             return []
         record, self.record = self.record, []
         return self.process(record)
-
-    def finish(self):
-        record, self.record = self.record, []
-        return self.process(record) if record else []
 
     def process(self, record):
         data_at = next((i for i, line in enumerate(record) if line.startswith(b"data:")), None)
@@ -464,15 +432,6 @@ class Relay(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self.relay()
 
-    def do_DELETE(self):
-        self.relay()
-
-    def do_PUT(self):
-        self.relay()
-
-    def do_PATCH(self):
-        self.relay()
-
     def send_text(self, status, text):
         body = text.encode("utf-8")
         self.send_response(status)
@@ -514,8 +473,7 @@ class Relay(http.server.BaseHTTPRequestHandler):
                     self.send_header(key, value)
             self.send_header("connection", "close")
             self.end_headers()
-            content_type = response.getheader("content-type") or ""
-            if "text/event-stream" in content_type:
+            if "text/event-stream" in (response.getheader("content-type") or ""):
                 self.copy_events(response, alias_of)
             else:
                 self.copy_bytes(response)
@@ -533,9 +491,6 @@ class Relay(http.server.BaseHTTPRequestHandler):
             for out in rewriter.feed(line):
                 self.wfile.write(out)
             self.wfile.flush()
-        for out in rewriter.finish():
-            self.wfile.write(out)
-        self.wfile.flush()
 
     def copy_bytes(self, response):
         while True:
@@ -553,59 +508,26 @@ def build_server(port):
         return http.server.ThreadingHTTPServer((CALLBACK_HOST, 0), Relay)
 
 
-def pid_alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def remove_stale_port_files():
-    try:
-        names = os.listdir(run_dir())
-    except OSError:
-        return
-    for name in names:
-        if not name.startswith("proxy-") or not name.endswith(".json"):
-            continue
-        path = os.path.join(run_dir(), name)
-        info = read_json(path)
-        pid = info.get("pid") if isinstance(info, dict) else None
-        if not isinstance(pid, int) or not pid_alive(pid):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-
-
 def cmd_serve(args):
     maki_pid = os.getppid()
     override = os.environ.get(PROXY_PORT_ENV)
     wanted = int(override) if override else PROXY_PORT_BASE + maki_pid % PROXY_PORT_SPAN
     server = build_server(wanted)
     port = server.server_address[1]
-    remove_stale_port_files()
     path = port_file(maki_pid)
-    write_private_json(path, {"port": port, "pid": os.getpid(), "maki_pid": maki_pid})
+    write_private_json(path, {"port": port, "pid": os.getpid()})
 
-    def shutdown(*_):
+    # maki kills the job with SIGKILL, and a crashed maki leaves it running, so
+    # the proxy watches its parent instead of relying on a signal.
+    def watch_parent():
+        while os.getppid() == maki_pid:
+            time.sleep(PARENT_POLL_S)
         try:
             os.remove(path)
         except OSError:
             pass
         os._exit(0)
 
-    def watch_parent():
-        while True:
-            time.sleep(PARENT_POLL_S)
-            if os.getppid() != maki_pid:
-                shutdown()
-
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
     threading.Thread(target=watch_parent, daemon=True).start()
     print("maki-claude proxy listening on %s:%d for maki pid %d" % (CALLBACK_HOST, port, maki_pid), flush=True)
     server.serve_forever()
@@ -801,38 +723,14 @@ def cmd_status(args):
     proxy = None
     if isinstance(info, dict) and isinstance(info.get("port"), int):
         proxy = {"port": info["port"], "alive": port_alive(info["port"])}
-    status = {
-        "logged_in": tokens is not None,
-        "email": (tokens or {}).get("email"),
-        "expires_in_s": (tokens["expires"] - now_ms()) // 1000 if tokens else None,
-        "token_path": token_path(),
-        "proxy": proxy,
-        "script": os.path.abspath(__file__),
-    }
-    emit(status)
-
-
-def cmd_usage(args):
-    tokens = require_tokens()
-    if expires_within(tokens, 0):
-        tokens = refresh_tokens(tokens)
-    request = urllib.request.Request(
-        UPSTREAM + USAGE_PATH,
-        headers={
-            "authorization": "Bearer " + tokens["access"],
-            "anthropic-beta": OAUTH_BETAS[-1],
-            "user-agent": USER_AGENT,
-            "accept": "application/json",
-        },
+    emit(
+        {
+            "logged_in": tokens is not None,
+            "email": (tokens or {}).get("email"),
+            "expires_in_s": (tokens["expires"] - now_ms()) // 1000 if tokens else None,
+            "proxy": proxy,
+        }
     )
-    try:
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
-            sys.stdout.write(response.read().decode("utf-8"))
-            sys.stdout.write("\n")
-    except urllib.error.HTTPError as err:
-        raise Fail("usage endpoint answered %d: %s" % (err.code, err.read().decode("utf-8", "replace").strip()))
-    except OSError as err:
-        raise Fail("usage endpoint unreachable: %s" % err)
 
 
 COMMANDS = {
@@ -844,7 +742,6 @@ COMMANDS = {
     "logout": cmd_logout,
     "serve": cmd_serve,
     "status": cmd_status,
-    "usage": cmd_usage,
 }
 
 

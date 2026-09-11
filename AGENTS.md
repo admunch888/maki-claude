@@ -6,15 +6,17 @@ It loads through the maki pack system, not as a builtin. Two parts:
   adds the Claude Code headers. Standard library only, one file, no `.py`
   extension because maki runs it by name.
 - `plugin/maki_claude.lua`: installs the script into the config `providers/`
-  directory, runs `claude serve` as a plugin-scoped job, registers `/claude`.
+  directory, runs `claude serve` as a plugin-scoped job, registers `/claude`
+  for a status line. Keep it to that: anything else the script can do is
+  reachable through `maki auth` or by running the script directly.
 
 ## Code guidelines
 
 - No trivial comments, minimal bloat, no unnecessary state.
 - Constants at the top of each file, in both languages.
 - Lua: fallible runtime operations return the `(value, err)` pair and never
-  throw. Setup at load is wrapped in `pcall` so a broken environment logs
-  instead of failing the package.
+  throw. Setup at load logs and returns on the first failure instead of
+  failing the package.
 - Python: user-facing failures raise `Fail`; `main` prints them to stderr and
   exits non-zero, which is how maki surfaces script errors.
 - The proxy must never read or store tokens. Auth arrives from maki in the

@@ -21,7 +21,7 @@ Code casing (`bash` becomes `Bash`), every other tool becomes
 `mcp__maki__<name>`, and tool calls coming back are renamed to what maki
 registered, including the names inside a `batch` call. `plugin/maki_claude.lua`
 installs the script, runs the proxy as a job for the life of the maki process,
-and adds the `/claude` command.
+and adds `/claude` for a status line.
 
 The proxy listens on `127.0.0.1` only, holds no credentials, and exits with
 maki.
@@ -65,15 +65,10 @@ example `claude/claude-opus-5`.
 
 ## Commands
 
-| Command | What it does |
-| --- | --- |
-| `/claude` or `/claude status` | Login state, token expiry, proxy state |
-| `/claude usage` | Subscription usage windows |
-| `/claude logout` | Deletes the stored tokens |
-| `/claude install` | Reinstalls the script and restarts the proxy |
-
-maki's own usage display works too: the provider base URL names the Anthropic
-host, so maki polls the subscription quota through the proxy.
+`/claude` shows the login state, token expiry, and whether the proxy is up.
+`maki auth logout claude` removes the stored tokens. maki's own usage display
+works with the subscription: the provider base URL names the Anthropic host,
+so maki polls the quota through the proxy.
 
 ## Permissions
 
@@ -87,7 +82,6 @@ The proxy logs to `maki.log`. The script also runs on its own:
 
 ```sh
 ~/.config/maki/providers/claude status
-~/.config/maki/providers/claude usage
 MAKI_CLAUDE_PROXY_PORT=47999 ~/.config/maki/providers/claude serve
 ```
 

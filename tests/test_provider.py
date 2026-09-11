@@ -60,10 +60,8 @@ class WireNameTest(unittest.TestCase):
     def test_flat_tools_get_the_mcp_alias(self):
         self.assertEqual(provider.wire_name("todo_write"), "mcp__maki__todo_write")
 
-    def test_mcp_tools_and_empty_names_pass_through(self):
+    def test_mcp_tools_pass_through(self):
         self.assertEqual(provider.wire_name("mcp__srv__docs"), "mcp__srv__docs")
-        self.assertEqual(provider.wire_name(""), "")
-        self.assertIsNone(provider.wire_name(None))
 
     def test_names_that_would_exceed_the_limit_stay_flat(self):
         long = "x" * (provider.NAME_LIMIT - len(provider.ALIAS_PREFIX) + 1)
@@ -81,7 +79,7 @@ class WireNameTest(unittest.TestCase):
 
 
 class TransformPayloadTest(unittest.TestCase):
-    def test_tools_history_and_tool_choice_are_renamed_consistently(self):
+    def test_tools_and_history_are_renamed_consistently(self):
         payload = {
             "tools": [
                 {"name": "bash", "input_schema": {}},
@@ -94,14 +92,12 @@ class TransformPayloadTest(unittest.TestCase):
                 {"role": "assistant", "content": [{"type": "tool_use", "id": "1", "name": "todo_write", "input": {}}]},
                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1", "content": "ok"}]},
             ],
-            "tool_choice": {"type": "tool", "name": "todo_write"},
         }
         out, alias_of = provider.transform_payload(payload)
         names = [t["name"] for t in out["tools"]]
         self.assertEqual(names, ["Bash", "mcp__maki__todo_write", "mcp__srv__docs", "web_search"])
         self.assertEqual(out["tools"][1]["cache_control"], {"type": "ephemeral"})
         self.assertEqual(out["messages"][1]["content"][0]["name"], "mcp__maki__todo_write")
-        self.assertEqual(out["tool_choice"]["name"], "mcp__maki__todo_write")
         self.assertEqual(alias_of, {"Bash": "bash", "mcp__maki__todo_write": "todo_write"})
 
     def test_payload_without_tools_is_untouched(self):
@@ -142,7 +138,6 @@ class SseRewriterTest(unittest.TestCase):
         out = []
         for line in sse(events).splitlines(keepends=True):
             out.extend(rewriter.feed(line))
-        out.extend(rewriter.finish())
         return parse_sse(b"".join(out))
 
     def test_tool_use_names_are_restored(self):
@@ -191,7 +186,6 @@ class LoginHelpersTest(unittest.TestCase):
         fresh = provider.tokens_from_response(
             {"access_token": "a", "refresh_token": "r", "expires_in": 3600, "account": {"uuid": "u", "email_address": "me@example.com"}}
         )
-        self.assertEqual(fresh["account_id"], "u")
         self.assertEqual(fresh["email"], "me@example.com")
         self.assertGreater(fresh["expires"], provider.now_ms())
         rotated = provider.tokens_from_response({"access_token": "b", "expires_in": 60}, fresh)
