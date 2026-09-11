@@ -37,7 +37,7 @@ DISPLAY_NAME = "Claude subscription"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
-SCOPES = "org:create_api_key user:profile user:inference"
+SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 CALLBACK_HOST = "127.0.0.1"
 CALLBACK_PORT = 53692
 CALLBACK_PATH = "/callback"
@@ -710,7 +710,8 @@ def wait_for_code(server, expected_state):
 def cmd_login(args):
     verifier = base64url(secrets.token_bytes(32))
     challenge = base64url(hashlib.sha256(verifier.encode("ascii")).digest())
-    state = base64url(secrets.token_bytes(16))
+    # The authorize page accepts the verifier as state, which is what pi sends.
+    state = verifier
     server = None
     if "--manual" not in args:
         try:
