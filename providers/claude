@@ -13,7 +13,6 @@ import http.server
 import json
 import os
 import secrets
-import select
 import sys
 import threading
 import time
@@ -52,7 +51,10 @@ def state_dir():
     if os.path.isdir(legacy):
         return legacy
     base = os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state")
-    return os.path.join(base, "maki")
+    candidate = os.path.join(base, "maki")
+    if os.path.isdir(candidate):
+        return candidate
+    return os.path.join(home, ".config", "maki")
 
 
 def token_path():
@@ -80,7 +82,25 @@ def load_tokens():
 
 def save_tokens(tokens):
     path = token_path()
-    os.makedirs(os.path.dirname(path), PRIVATE_DIR_MODE, exist_ok=True)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.name == "nt":
+        # File permissions are best-effort on Windows; restrict the token file
+        # to the current user when the ACL helper is available.
+        try:
+            import subprocess
+
+            user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+            if user:
+                subprocess.run(
+                    ["icacls", path, "/setowner", user, "/inheritance:r", "/grant:r", user + ":R"],
+                    capture_output=True,
+                    check=False,
+                )
+        except OSError:
+            pass
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(tokens, handle, indent=2)
+        return
     tmp = path + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, TOKEN_FILE_MODE)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -214,6 +234,23 @@ class CallbackHandler(http.server.BaseHTTPRequestHandler):
             self.reply(200, "Login complete. You can close this window and return to the terminal.")
 
 
+def stdin_ready(timeout_s):
+    """True when a line is available on stdin within the timeout."""
+    if os.name == "nt":
+        import msvcrt
+
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if msvcrt.kbhit():
+                return True
+            time.sleep(0.05)
+        return False
+    import select
+
+    ready, _, _ = select.select([sys.stdin], [], [], timeout_s)
+    return bool(ready)
+
+
 def wait_for_code(server, expected_state):
     """Returns the code from whichever arrives first: the browser callback or a
     pasted redirect URL on stdin. A closed stdin leaves only the callback."""
@@ -228,8 +265,7 @@ def wait_for_code(server, expected_state):
         if not stdin_open:
             time.sleep(STDIN_POLL_S)
             continue
-        ready, _, _ = select.select([sys.stdin], [], [], STDIN_POLL_S)
-        if not ready:
+        if not stdin_ready(STDIN_POLL_S):
             continue
         line = sys.stdin.readline()
         if not line:
@@ -245,7 +281,9 @@ def wait_for_code(server, expected_state):
 
 
 def has_desktop():
-    return sys.platform == "darwin" or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    return sys.platform in ("darwin", "win32") or bool(
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    )
 
 
 def cmd_login():

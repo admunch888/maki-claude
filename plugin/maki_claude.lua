@@ -4,8 +4,8 @@
 
 local SCRIPT_NAME = "claude"
 local PROVIDERS_DIR = "providers"
-local SCRIPT_MODE = "755"
 local JOB_WAIT_MS = 20000
+local IS_WINDOWS = package.config:sub(1, 1) == "\\"
 local TITLE = "claude"
 local LOGIN_HINT = "run `maki auth login claude` in a terminal, then restart maki"
 
@@ -24,7 +24,21 @@ local function script_install_path()
   if not dir then
     return nil, "cannot locate the maki config directory"
   end
-  return maki.fs.joinpath(dir, PROVIDERS_DIR, SCRIPT_NAME)
+  local name = IS_WINDOWS and (SCRIPT_NAME .. ".py") or SCRIPT_NAME
+  return maki.fs.joinpath(dir, PROVIDERS_DIR, name)
+end
+
+-- The provider script is Python; on Windows there is no shebang exec, so run
+-- it through the interpreter. Prefers python3, falls back to python.
+local function script_argv(script)
+  local interpreter = "python3"
+  if maki.fn.executable(interpreter) == 0 then
+    interpreter = "python"
+  end
+  if maki.fn.executable(interpreter) == 0 then
+    return nil, "python3 or python not found on PATH"
+  end
+  return { interpreter, script }
 end
 
 -- Plugin scope: at load there is no task for a job to belong to.
@@ -65,9 +79,12 @@ local function install_script()
   if not written then
     return nil, write_err
   end
-  local _, chmod_err = run({ "chmod", SCRIPT_MODE, dst })
-  if chmod_err then
-    return nil, "chmod failed: " .. chmod_err
+  -- Only unix needs the exec bit; on Windows the plugin invokes python explicitly.
+  if not IS_WINDOWS then
+    local _, chmod_err = run({ "chmod", "755", dst })
+    if chmod_err then
+      return nil, "chmod failed: " .. chmod_err
+    end
   end
   return dst, nil, true
 end
@@ -90,7 +107,12 @@ local function status()
       notify(err, "error")
       return
     end
-    local out, run_err = run({ script, "status" })
+    local argv, argv_err = script_argv(script)
+    if not argv then
+      notify(argv_err, "error")
+      return
+    end
+    local out, run_err = run({ argv[1], argv[2], "status" })
     if not out then
       notify(run_err, "error")
       return
