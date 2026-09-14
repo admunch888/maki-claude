@@ -57,7 +57,10 @@ local function run(argv)
 end
 
 -- Copies the script from the package into the config providers directory when
--- the two differ. Returns the installed path and whether it changed.
+-- the two differ. On Windows maki's provider discovery only accepts
+-- .exe/.bat/.cmd/.ps1, so we install the Python script as claude.py plus a
+-- claude.cmd shim that invokes it. Returns the installed path and whether it
+-- changed.
 local function install_script()
   local dst, err = script_install_path()
   if not dst then
@@ -68,23 +71,42 @@ local function install_script()
   if not content then
     return nil, "cannot read " .. source .. ": " .. tostring(read_err)
   end
-  if maki.fs.read(dst) == content then
-    return dst, nil, false
-  end
   local ok, mk_err = maki.fs.mkdir(maki.fs.dirname(dst), { parents = true })
   if not ok then
     return nil, mk_err
+  end
+  if IS_WINDOWS then
+    -- claude.py: the actual Python script (not discoverable by maki, but the
+    -- shim below invokes it explicitly).
+    local py_path = maki.fs.joinpath(maki.fs.dirname(dst), SCRIPT_NAME .. ".py")
+    if maki.fs.read(py_path) ~= content then
+      local written, write_err = maki.fs.atomic_write(py_path, content)
+      if not written then
+        return nil, write_err
+      end
+    end
+    -- claude.cmd: the shim maki discovers. %~dp0 is resolved by cmd.exe at
+    -- runtime so the path is portable.
+    local cmd_path = maki.fs.joinpath(maki.fs.dirname(dst), SCRIPT_NAME .. ".cmd")
+    local shim = '@echo off\r\npython "%%~dp0' .. SCRIPT_NAME .. '.py" %* \r\n'
+    if maki.fs.read(cmd_path) ~= shim then
+      local written, write_err = maki.fs.atomic_write(cmd_path, shim)
+      if not written then
+        return nil, write_err
+      end
+    end
+    return cmd_path, nil, true
+  end
+  if maki.fs.read(dst) == content then
+    return dst, nil, false
   end
   local written, write_err = maki.fs.atomic_write(dst, content)
   if not written then
     return nil, write_err
   end
-  -- Only unix needs the exec bit; on Windows the plugin invokes python explicitly.
-  if not IS_WINDOWS then
-    local _, chmod_err = run({ "chmod", "755", dst })
-    if chmod_err then
-      return nil, "chmod failed: " .. chmod_err
-    end
+  local _, chmod_err = run({ "chmod", "755", dst })
+  if chmod_err then
+    return nil, "chmod failed: " .. chmod_err
   end
   return dst, nil, true
 end
