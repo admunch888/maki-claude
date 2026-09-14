@@ -129,12 +129,18 @@ local function status()
       notify(err, "error")
       return
     end
-    local argv, argv_err = script_argv(script)
-    if not argv then
-      notify(argv_err, "error")
-      return
+    local argv
+    if IS_WINDOWS then
+      -- .cmd shim is a batch file; invoke directly, not via python
+      argv = { script, "status" }
+    else
+      local interpreter = "python3"
+      if maki.fn.executable(interpreter) ~= 0 then
+        interpreter = "python"
+      end
+      argv = { interpreter, script, "status" }
     end
-    local out, run_err = run({ argv[1], argv[2], "status" })
+    local out, run_err = run(argv)
     if not out then
       notify(run_err, "error")
       return
